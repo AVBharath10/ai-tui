@@ -1,4 +1,4 @@
-# AIUI: Terminal Control Layer for AI Agents
+# AI-TUI: Terminal Control Layer for AI Agents
 
 **AIUI** is a terminal-native wrapper designed to give developers visibility and control over AI coding agents. It runs existing CLI tools (like `opencode-ai`) inside a pseudo-terminal (PTY) while providing a real-time side-by-side view of the file system changes happening in your project.
 
