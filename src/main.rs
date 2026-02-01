@@ -9,10 +9,11 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, List, ListItem},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, StatefulWidget},
     Terminal,
 };
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
+use chrono::{DateTime, Local, Duration as ChronoDuration};
 use std::{
     collections::VecDeque,
     io::{Read, Write},
@@ -32,7 +33,7 @@ enum AppEvent {
 struct FileChange {
     path: String,
     kind: ChangeKind,
-    timestamp: std::time::Instant,
+    timestamp: DateTime<Local>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -46,6 +47,8 @@ struct AppState {
     file_changes: VecDeque<FileChange>,
     // key: (path, kind), value: instant when last recorded
     debounce_map: std::collections::HashMap<(String, ChangeKind), std::time::Instant>,
+    list_state: ListState,
+    show_sidebar: bool,
 }
 
 impl AppState {
@@ -53,6 +56,8 @@ impl AppState {
         Self {
             file_changes: VecDeque::with_capacity(50),
             debounce_map: std::collections::HashMap::new(),
+            list_state: ListState::default(),
+            show_sidebar: true,
         }
     }
 
@@ -81,15 +86,18 @@ impl AppState {
         self.debounce_map.insert(key, std::time::Instant::now());
 
         // 3. Add to UI List
-        if self.file_changes.len() >= 20 {
+        if self.file_changes.len() >= 50 {
             self.file_changes.pop_back();
         }
 
         self.file_changes.push_front(FileChange {
             path: file_name,
             kind,
-            timestamp: std::time::Instant::now(),
+            timestamp: Local::now(),
         });
+        
+        // Auto-select top if we added a new item
+        self.list_state.select(Some(0));
     }
 }
 
@@ -230,17 +238,31 @@ fn run_app(
         terminal.draw(|frame| {
             let area = frame.area();
             
-            // Split screen
-            let chunks = Layout::default()
-                .direction(Direction::Horizontal)
+            // 1. Vertical Split: Main (Top) vs Status Bar (Bottom)
+            let v_chunks = Layout::default()
+                .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Percentage(70), // Terminal
-                    Constraint::Percentage(30), // Sidebar
+                    Constraint::Min(1),    // Main Area
+                    Constraint::Length(1), // Status Bar
                 ])
                 .split(area);
                 
-            let term_area = chunks[0];
-            let side_area = chunks[1];
+            let main_area = v_chunks[0];
+            let status_area = v_chunks[1];
+
+            // 2. Horizontal Split: Terminal vs Sidebar
+            let (term_area, side_area) = if state.show_sidebar {
+                let h_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Percentage(70), // Terminal
+                        Constraint::Percentage(30), // Sidebar
+                    ])
+                    .split(main_area);
+                (h_chunks[0], Some(h_chunks[1]))
+            } else {
+                (main_area, None)
+            };
 
             // --- Render Terminal ---
             // Render the VT100 screen to the buffer
@@ -290,26 +312,54 @@ fn run_app(
             }
             
             // --- Render Sidebar ---
-            let block = Block::default()
-                .title(" Active Monitoring ")
-                .borders(Borders::ALL)
-                .style(Style::default().fg(Color::DarkGray));
-            
-            let items: Vec<ListItem> = state.file_changes
-                .iter()
-                .map(|change| {
-                    let (symbol, color) = match change.kind {
-                        ChangeKind::Create => ("+", Color::Green),
-                        ChangeKind::Modify => ("~", Color::Yellow),
-                        ChangeKind::Remove => ("-", Color::Red),
-                    };
-                    let content = format!("{} {}", symbol, change.path);
-                    ListItem::new(content).style(Style::default().fg(color))
-                })
-                .collect();
+            if let Some(area) = side_area {
+                let block = Block::default()
+                    .title(" Active Monitoring ")
+                    .borders(Borders::ALL)
+                    .style(Style::default().fg(Color::DarkGray));
                 
-            let list = List::new(items).block(block);
-            frame.render_widget(list, side_area);
+                let now = Local::now();
+                let items: Vec<ListItem> = state.file_changes
+                    .iter()
+                    .map(|change| {
+                        let (symbol, color) = match change.kind {
+                            ChangeKind::Create => ("+", Color::Green),
+                            ChangeKind::Modify => ("~", Color::Yellow),
+                            ChangeKind::Remove => ("-", Color::Red),
+                        };
+                        
+                        let time_diff = now.signed_duration_since(change.timestamp);
+                        let time_str = if time_diff.num_seconds() < 60 {
+                            format!("{}s ago", time_diff.num_seconds())
+                        } else {
+                            change.timestamp.format("[%H:%M:%S]").to_string()
+                        };
+
+                        let content = format!("{} {} {}", time_str, symbol, change.path);
+                        ListItem::new(content).style(Style::default().fg(color))
+                    })
+                    .collect();
+                    
+                let list = List::new(items)
+                    .block(block)
+                    .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+                frame.render_stateful_widget(list, area, &mut state.list_state);
+            }
+
+            // --- Render Status Bar ---
+            let total = state.file_changes.len();
+            let created = state.file_changes.iter().filter(|c| c.kind == ChangeKind::Create).count();
+            let modified = state.file_changes.iter().filter(|c| c.kind == ChangeKind::Modify).count();
+            let removed = state.file_changes.iter().filter(|c| c.kind == ChangeKind::Remove).count();
+            
+            let status_text = format!(
+                " Total: {} | +{} ~{} -{} | Ctrl+H: Toggle | Ctrl+L: Clear | Ctrl+Up/Down: Scroll ",
+                total, created, modified, removed
+            );
+            
+            let status_bar = Paragraph::new(status_text)
+                .style(Style::default().fg(Color::Black).bg(Color::White));
+            frame.render_widget(status_bar, status_area);
             
         })?;
 
@@ -335,10 +385,41 @@ fn run_app(
                 }
                 Event::Key(key) => {
                     match key.code {
+                        // App Control
                         KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => writer.write_all(&[3])?,
-                        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => writer.write_all(&[4])?,
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => writer.write_all(&[3])?, // ETX
+                        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => writer.write_all(&[4])?, // EOT
+
+                        // UI Control
+                        KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            state.show_sidebar = !state.show_sidebar;
+                        }
+                        KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            state.file_changes.clear();
+                            state.list_state.select(None);
+                        }
+                        KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            let i = match state.list_state.selected() {
+                                Some(i) => if i == 0 { 0 } else { i - 1 },
+                                None => 0,
+                            };
+                            state.list_state.select(Some(i));
+                        }
+                        KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            let i = match state.list_state.selected() {
+                                Some(i) => {
+                                    if i >= state.file_changes.len().saturating_sub(1) {
+                                        state.file_changes.len().saturating_sub(1)
+                                    } else {
+                                        i + 1
+                                    }
+                                }
+                                None => 0,
+                            };
+                            state.list_state.select(Some(i));
+                        }
                         
+                        // Pass through to PTY
                         KeyCode::Char(c) => writer.write_all(c.to_string().as_bytes())?,
                         KeyCode::Enter => writer.write_all(b"\r")?,
                         KeyCode::Backspace => writer.write_all(&[127])?, // DEL
