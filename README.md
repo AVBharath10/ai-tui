@@ -60,7 +60,7 @@ graph LR
     App -->|Render| TUI[Terminal UI]
     
     subgraph "System"
-        PTY -- Runs --> CLI[AI Agent (opencode)]
+        PTY -- Runs --> CLI["AI Agent (opencode)"]
         CLI -- Modifies --> FS[File System]
     end
     
