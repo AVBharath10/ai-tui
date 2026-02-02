@@ -40,6 +40,14 @@ enum AppEvent {
 
 
 
+#[derive(Clone)]
+struct PendingChange {
+    path: String,
+    old_content: String,
+    new_content: String,
+    diff_text: String,
+}
+
 struct AppState {
     file_changes: VecDeque<FileChange>,
     debounce_map: std::collections::HashMap<(String, ChangeKind), Instant>,
@@ -47,6 +55,12 @@ struct AppState {
     show_sidebar: bool,
     
     file_cache: std::collections::HashMap<String, String>,
+    
+    // Approval System
+    approval_queue: VecDeque<PendingChange>,
+    ignore_next_write: std::collections::HashSet<String>,
+    modal_active: bool,
+    
     show_diff_view: bool,
     parser: vt100::Parser,
     
@@ -80,6 +94,11 @@ impl AppState {
             list_state: ListState::default(),
             show_sidebar: true,
             file_cache: cache,
+            
+            approval_queue: VecDeque::new(),
+            ignore_next_write: std::collections::HashSet::new(),
+            modal_active: false,
+            
             show_diff_view: false,
             parser: vt100::Parser::new(24, 80, 0), // Initial size, will be updated
             current_theme: ThemeVariant::Zinc,
@@ -100,7 +119,7 @@ impl AppState {
              return;
         }
 
-        // 2. Debounce
+        // 3. Debounce
         let key = (file_name.clone(), kind.clone());
         if let Some(last_time) = self.debounce_map.get(&key) {
             if last_time.elapsed() < Duration::from_millis(500) {
@@ -122,18 +141,22 @@ impl AppState {
         //     .and_then(|mut f| writeln!(f, "Change detected: {:?} {:?}", path, kind));
 
         let mut diff_output = None;
+        let mut needs_approval = false;
+
         if kind == ChangeKind::Modify || kind == ChangeKind::Create {
-            if let Ok(new_content) = std::fs::read_to_string(&path) {
-                let old_content = self.file_cache.get(&cache_key).map(|s| s.as_str()).unwrap_or("");
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                new_content = content;
                 
-                let diff = TextDiff::from_lines(old_content, &new_content);
+                // If content hasn't effectively changed from our cache, ignore it
+                if new_content == old_content {
+                    return; 
+                }
+
+                // Generate Diff
+                let diff = TextDiff::from_lines(&old_content, &new_content);
                 let mut output = String::new();
-                
-                // Use grouped_ops for Unified Diff style (3 lines context)
                 for (idx, group) in diff.grouped_ops(3).iter().enumerate() {
-                    if idx > 0 {
-                        output.push_str("...\n");
-                    }
+                    if idx > 0 { output.push_str("...\n"); }
                     for op in group {
                         for change in diff.iter_changes(op) {
                             let (sign, _) = match change.tag() {
@@ -146,40 +169,57 @@ impl AppState {
                     }
                 }
                 
-                // If output is empty (no changes detected?), fallback to showing all?
-                // Or if it's a new file, it will show all lines as +
                 if output.is_empty() && !new_content.is_empty() {
-                     // Should not happen if diff logic works, but fallback just in case
                      output = format!("+{}", new_content.replace('\n', "\n+"));
                 } else if output.is_empty() {
                     output = "No Content Changes".to_string();
                 }
 
-                diff_output = Some(output);
+                diff_output = Some(output.clone());
                 
-                // Update Cache
-                self.file_cache.insert(cache_key, new_content);
+                // QUEUE FOR APPROVAL
+                self.approval_queue.push_back(PendingChange {
+                    path: cache_key.clone(), // Store full path for revert
+                    old_content: old_content,
+                    new_content: new_content, // Don't update cache yet
+                    diff_text: output,
+                });
+                self.modal_active = true;
+                needs_approval = true;
             }
         } else if kind == ChangeKind::Remove {
-             self.file_cache.remove(&cache_key);
-             diff_output = Some("File Deleted".to_string());
+             // Handle Deletion Approval
+             // logic: new_content is empty
+             if !old_content.is_empty() {
+                let diff = format!("File Deleted: {}", file_name);
+                diff_output = Some(diff.clone());
+                
+                self.approval_queue.push_back(PendingChange {
+                    path: cache_key.clone(),
+                    old_content: old_content,
+                    new_content: String::new(), // Empty means deleted logic?
+                    // Actually, if we reject deletion, we need to write old_content back.
+                    // If we accept, we remove from cache.
+                    diff_text: diff,
+                });
+                self.modal_active = true;
+                needs_approval = true;
+             }
         }
 
+        // Add to Sidebar (Visual Log)
+        if self.file_changes.len() >= 50 {
+            self.file_changes.pop_back();
+        }
         self.file_changes.push_front(FileChange {
             path: file_name,
             kind,
             timestamp: Local::now(),
             diff: diff_output,
         });
-        
-        // Auto-select top if we added a new item
         self.list_state.select(Some(0));
     }
 }
-
-
-
-
 
 fn main() -> Result<()> {
     // 1. Setup PTY
@@ -298,7 +338,8 @@ fn run_app(
         while let Ok(event) = rx.try_recv() {
             match event {
                 AppEvent::PtyData(data) => {
-                    // Update VT100 parser
+                     // Only process PTY data if modal is NOT active? 
+                     // No, background PTY should still run/update, just input blocked.
                     let mut state = app_state.lock().unwrap();
                     state.parser.process(&data);
                 }
@@ -325,26 +366,20 @@ fn run_app(
 
             let area = frame.area();
             
-            // 1. Vertical Split: Main (Top) vs Status Bar (Bottom)
+            // 1. Vertical Split
             let v_chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(1),    // Main Area
-                    Constraint::Length(1), // Status Bar
-                ])
+                .constraints([Constraint::Min(1), Constraint::Length(1)])
                 .split(area);
                 
             let main_area = v_chunks[0];
             let status_area = v_chunks[1];
 
-            // 2. Horizontal Split: Terminal vs Sidebar
+            // 2. Horizontal Split
             let (term_area, side_area) = if state.show_sidebar {
                 let h_chunks = Layout::default()
                     .direction(Direction::Horizontal)
-                    .constraints([
-                        Constraint::Percentage(70), // Terminal/Diff
-                        Constraint::Percentage(30), // Sidebar
-                    ])
+                    .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
                     .split(main_area);
                 (h_chunks[0], Some(h_chunks[1]))
             } else {
@@ -357,50 +392,31 @@ fn run_app(
                  let selected_change = selected_index.and_then(|i| state.file_changes.get(i));
                  ui::components::diff_view::render(frame, term_area, selected_change, &theme);
             } else {
-                // Render the VT100 screen to the buffer
+                // Render VT100
                 let screen = state.parser.screen();
                 let (rows, cols) = screen.size();
                 let buffer = frame.buffer_mut();
-
-                // We need to handle the offset of the term_area
-                // term_area has x, y. 
-                // We map loop(0..rows) -> term_area.y + row
-                
                 for row in 0..rows.min(term_area.height) {
                     for col in 0..cols.min(term_area.width) {
                         if let Some(cell) = screen.cell(row, col) {
-                            let fg = convert_color(cell.fgcolor());
-                            let bg = convert_color(cell.bgcolor());
-                            
-                            let mut style = Style::default().fg(fg).bg(bg);
-                            if cell.bold() { style = style.add_modifier(Modifier::BOLD); }
-                            if cell.italic() { style = style.add_modifier(Modifier::ITALIC); }
-                            if cell.underline() { style = style.add_modifier(Modifier::UNDERLINED); }
-                            if cell.inverse() { style = style.add_modifier(Modifier::REVERSED); }
-    
-                            let contents = cell.contents();
-                            let grid_x = term_area.x + col;
-                            let grid_y = term_area.y + row;
-                            
-                            if !contents.is_empty() {
-                                buffer.set_string(grid_x, grid_y, contents, style);
-                            } else {
-                                // Clear background
-                                 buffer.set_string(grid_x, grid_y, " ", style);
-                            }
+                             let fg = convert_color(cell.fgcolor());
+                             let bg = convert_color(cell.bgcolor());
+                             let mut style = Style::default().fg(fg).bg(bg);
+                             if cell.bold() { style = style.add_modifier(Modifier::BOLD); }
+                             if cell.italic() { style = style.add_modifier(Modifier::ITALIC); }
+                             if cell.underline() { style = style.add_modifier(Modifier::UNDERLINED); }
+                             if cell.inverse() { style = style.add_modifier(Modifier::REVERSED); }
+                             let contents = cell.contents();
+                             if !contents.is_empty() { buffer.set_string(term_area.x + col, term_area.y + row, contents, style); }
+                             else { buffer.set_string(term_area.x + col, term_area.y + row, " ", style); }
                         }
                     }
                 }
-                
-                 // Render Cursor (adjusted for term_area)
-                if !screen.hide_cursor() {
-                    let (crow, ccol) = screen.cursor_position();
-                    if ccol < term_area.width && crow < term_area.height {
-                         frame.set_cursor_position(Position { 
-                             x: term_area.x + ccol, 
-                             y: term_area.y + crow 
-                         });
-                    }
+                if !screen.hide_cursor() && !state.modal_active {
+                     let (crow, ccol) = screen.cursor_position();
+                     if ccol < term_area.width && crow < term_area.height {
+                          frame.set_cursor_position(Position { x: term_area.x + ccol, y: term_area.y + crow });
+                     }
                 }
             }
             
@@ -456,8 +472,42 @@ fn run_app(
                     state.parser = vt100::Parser::new(term_rows, term_cols, 0);
                 }
                 Event::Key(key) => {
+                    // *** MODAL INTERCEPTION ***
+                    if state.modal_active {
+                        match key.code {
+                            KeyCode::Char('y') => {
+                                if let Some(pending) = state.approval_queue.pop_front() {
+                                    // Accept: Update Cache
+                                    if pending.new_content.is_empty() {
+                                        state.file_cache.remove(&pending.path);
+                                    } else {
+                                        state.file_cache.insert(pending.path, pending.new_content);
+                                    }
+                                }
+                                state.modal_active = !state.approval_queue.is_empty();
+                            }
+                            KeyCode::Char('n') => {
+                                if let Some(pending) = state.approval_queue.pop_front() {
+                                    // Reject: Revert to Old Content
+                                    state.ignore_next_write.insert(pending.path.clone());
+                                    
+                                    if pending.old_content.is_empty() {
+                                        // It was a new file, so delete it
+                                        let _ = std::fs::remove_file(&pending.path);
+                                    } else {
+                                        // Revert content
+                                        let _ = std::fs::write(&pending.path, &pending.old_content);
+                                    }
+                                }
+                                state.modal_active = !state.approval_queue.is_empty();
+                            }
+                            _ => {} // Consume other keys
+                        }
+                        return Ok(()); // SKIP NORMAL PROCESSING
+                    }
+
+                    // *** NORMAL PROCESSING ***
                     match key.code {
-                        // App Control
                         KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => writer.write_all(&[3])?, // ETX
                         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => writer.write_all(&[4])?, // EOT
@@ -479,33 +529,19 @@ fn run_app(
                         }
 
                         KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            let i = match state.list_state.selected() {
-                                Some(i) => if i == 0 { 0 } else { i - 1 },
-                                None => 0,
-                            };
+                            let i = state.list_state.selected().map_or(0, |i| i.saturating_sub(1));
                             state.list_state.select(Some(i));
                         }
                         KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            let i = match state.list_state.selected() {
-                                Some(i) => {
-                                    if i >= state.file_changes.len().saturating_sub(1) {
-                                        state.file_changes.len().saturating_sub(1)
-                                    } else {
-                                        i + 1
-                                    }
-                                }
-                                None => 0,
-                            };
-                            state.list_state.select(Some(i));
+                             let i = state.list_state.selected().map_or(0, |i| (i + 1).min(state.file_changes.len().saturating_sub(1)));
+                             state.list_state.select(Some(i));
                         }
-                        
                         // Pass through to PTY
                         KeyCode::Char(c) => writer.write_all(c.to_string().as_bytes())?,
                         KeyCode::Enter => writer.write_all(b"\r")?,
-                        KeyCode::Backspace => writer.write_all(&[127])?, // DEL
+                        KeyCode::Backspace => writer.write_all(&[127])?,
                         KeyCode::Tab => writer.write_all(&[9])?,
                         KeyCode::Esc => writer.write_all(&[27])?,
-                        
                         KeyCode::Up => writer.write_all(b"\x1b[A")?,
                         KeyCode::Down => writer.write_all(b"\x1b[B")?,
                         KeyCode::Right => writer.write_all(b"\x1b[C")?,
@@ -518,6 +554,27 @@ fn run_app(
             }
         }
     }
+}
+
+// Helper for centering modal
+fn centered_rect(percent_x: u16, percent_y: u16, r: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
 }
 
 fn convert_color(c: vt100::Color) -> Color {
