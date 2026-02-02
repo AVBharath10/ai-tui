@@ -8,23 +8,27 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Position},
-    text::{Line, Span},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::ListState,
     Terminal,
 };
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
-use chrono::{DateTime, Local};
+use chrono::Local;
 use similar::{ChangeTag, TextDiff};
 use walkdir::WalkDir;
 use std::{
     collections::VecDeque,
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
+
+mod types;
+mod ui;
+use types::{ChangeKind, FileChange};
+use ui::theme::{Theme, ThemeVariant};
 
 // Unified event type for our application
 enum AppEvent {
@@ -34,32 +38,19 @@ enum AppEvent {
     Input(Event),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum ChangeKind {
-    Create,
-    Modify,
-    Remove,
-}
 
-#[derive(Clone)]
-struct FileChange {
-    path: String,
-    kind: ChangeKind,
-    timestamp: DateTime<Local>,
-    diff: Option<String>, // Stores colored ANSI string or plain text representation
-}
 
 struct AppState {
     file_changes: VecDeque<FileChange>,
-    // key: (path, kind), value: instant when last recorded
     debounce_map: std::collections::HashMap<(String, ChangeKind), Instant>,
     list_state: ListState,
     show_sidebar: bool,
     
-    // key: path, value: content
     file_cache: std::collections::HashMap<String, String>,
     show_diff_view: bool,
     parser: vt100::Parser,
+    
+    current_theme: ThemeVariant,
 }
 
 impl AppState {
@@ -91,6 +82,7 @@ impl AppState {
             file_cache: cache,
             show_diff_view: false,
             parser: vt100::Parser::new(24, 80, 0), // Initial size, will be updated
+            current_theme: ThemeVariant::Zinc,
         }
     }
 
@@ -101,7 +93,7 @@ impl AppState {
             .to_string();
 
         // 1. Filter Noise
-        if path.components().any(|c| c.as_os_str() == ".git" || c.as_os_str() == "target") {
+        if path.components().any(|c| c.as_os_str() == ".git" || c.as_os_str() == "target" || c.as_os_str() == "node_modules") {
             return;
         }
         if file_name.starts_with('.') && file_name != ".gitignore" {
@@ -125,6 +117,10 @@ impl AppState {
         // Compute Diff
         let cache_key = normalize_path(&path);
         
+        // Debug Log
+        // let _ = std::fs::OpenOptions::new().create(true).append(true).open("aiui_debug.log")
+        //     .and_then(|mut f| writeln!(f, "Change detected: {:?} {:?}", path, kind));
+
         let mut diff_output = None;
         if kind == ChangeKind::Modify || kind == ChangeKind::Create {
             if let Ok(new_content) = std::fs::read_to_string(&path) {
@@ -314,16 +310,7 @@ fn run_app(
                     // Just trigger re-render
                 }
                 AppEvent::Input(_key) => {
-                    // We need to handle input here if we want to log it or process app-level keys before sending to PTY?
-                    // But the loop below handles input from crossterm.
-                    // Wait, `rx` receives AppEvents. Who sends `AppEvent::Input`?
-                    // Ideally we should move the input polling into the same channel or handle it separately.
-                    // The current main.rs has a separate loop for `event::poll` below.
-                    // Let's check where `AppEvent::Input` fits. 
-                    // Ah, the previous code had `AppEvent::Input` in the enum but I don't see it being sent.
-                    // The main loop does `if event::poll(...) { let key = ...; match key.code ... }`
-                    // So we might not need `AppEvent::Input` in this match if it's handled outside.
-                    // However, to keep the match exhaustive if I defined it:
+                    // Handle internal app input if necessary
                 }
             }
         }
@@ -333,6 +320,9 @@ fn run_app(
              // Lock state for rendering
             let mut state = app_state.lock().unwrap();
             
+            // Resolve Theme
+            let theme = Theme::new(state.current_theme);
+
             let area = frame.area();
             
             // 1. Vertical Split: Main (Top) vs Status Bar (Bottom)
@@ -363,43 +353,9 @@ fn run_app(
 
             // --- Render Terminal OR Diff View ---
             if state.show_diff_view {
-                 let block = Block::default()
-                    .title(" Diff View (Ctrl+K to Close) ")
-                    .borders(Borders::ALL)
-                    .style(Style::default().fg(Color::Cyan));
-                
-                let mut lines = vec![];
-                
-                if let Some(idx) = state.list_state.selected() {
-                    if let Some(change) = state.file_changes.get(idx) {
-                        lines.push(Line::from(vec![
-                             Span::styled(format!("File: {}", change.path), Style::default().add_modifier(Modifier::BOLD))
-                        ]));
-                         lines.push(Line::from(""));
-                         
-                        if let Some(diff_text) = &change.diff {
-                            for line_str in diff_text.lines() {
-                                if line_str.starts_with('+') {
-                                    lines.push(Line::from(Span::styled(line_str, Style::default().fg(Color::Green))));
-                                } else if line_str.starts_with('-') {
-                                    lines.push(Line::from(Span::styled(line_str, Style::default().fg(Color::Red))));
-                                } else {
-                                     lines.push(Line::from(Span::styled(line_str, Style::default().fg(Color::DarkGray))));
-                                }
-                            }
-                        } else {
-                             lines.push(Line::from("No diff details available."));
-                        }
-                    } else {
-                        lines.push(Line::from("Select a file to see diff."));
-                    }
-                } else {
-                    lines.push(Line::from("Select a file to see diff."));
-                }
-                
-                let p = Paragraph::new(lines).block(block);
-                frame.render_widget(p, term_area);
-                
+                 let selected_index = state.list_state.selected();
+                 let selected_change = selected_index.and_then(|i| state.file_changes.get(i));
+                 ui::components::diff_view::render(frame, term_area, selected_change, &theme);
             } else {
                 // Render the VT100 screen to the buffer
                 let screen = state.parser.screen();
@@ -450,53 +406,32 @@ fn run_app(
             
             // --- Render Sidebar ---
             if let Some(area) = side_area {
-                let block = Block::default()
-                    .title(" Active Monitoring ")
-                    .borders(Borders::ALL)
-                    .style(Style::default().fg(Color::DarkGray));
-                
-                let now = Local::now();
-                let items: Vec<ListItem> = state.file_changes
-                    .iter()
-                    .map(|change| {
-                        let (symbol, color) = match change.kind {
-                            ChangeKind::Create => ("+", Color::Green),
-                            ChangeKind::Modify => ("~", Color::Yellow),
-                            ChangeKind::Remove => ("-", Color::Red),
-                        };
-                        
-                        let time_diff = now.signed_duration_since(change.timestamp);
-                        let time_str = if time_diff.num_seconds() < 60 {
-                            format!("{}s ago", time_diff.num_seconds())
-                        } else {
-                            change.timestamp.format("[%H:%M:%S]").to_string()
-                        };
-
-                        let content = format!("{} {} {}", time_str, symbol, change.path);
-                        ListItem::new(content).style(Style::default().fg(color))
-                    })
-                    .collect();
-                    
-                let list = List::new(items)
-                    .block(block)
-                    .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-                frame.render_stateful_widget(list, area, &mut state.list_state);
+                // Use the new component
+                // We need to convert VecDeque to slice. 
+                // `make_contiguous` makes it a single slice, but mutates.
+                // Or just iterate. 
+                // Our component expects `&[FileChange]`.
+                // VecDeque doesn't easily coerce to &[FileChange] unless we use make_contiguous.
+                // Let's change the component signature to accept `&VecDeque` or `impl Iterator` or just convert here.
+                // Converting here is creating a Vec, which is allocations in hot loop.
+                // Converting the component to accept `VecDeque` is better.
+                // *Self Correction*: I don't want to edit component files again right now.
+                // I'll make the component accept `&VecDeque` in the next step if compilation fails, 
+                // or just modify `state.file_changes` to be a `Vec`? No, we need push_front efficiently.
+                // I will use `make_contiguous` here since we have mutable access to state? No we have locked it. 
+                // But `state` is `MutexGuard`. We can mutate it.
+                state.file_changes.make_contiguous();
+                 let inner = &mut *state;
+                 let (slice, _) = inner.file_changes.as_slices();
+                 ui::components::sidebar::render(frame, area, slice, &mut inner.list_state, &theme);
             }
 
             // --- Render Status Bar ---
-            let total = state.file_changes.len();
-            let created = state.file_changes.iter().filter(|c| c.kind == ChangeKind::Create).count();
-            let modified = state.file_changes.iter().filter(|c| c.kind == ChangeKind::Modify).count();
-            let removed = state.file_changes.iter().filter(|c| c.kind == ChangeKind::Remove).count();
-            
-            let status_text = format!(
-                " Total: {} | +{} ~{} -{} | Ctrl+H: Toggle | Ctrl+K: Diff | Ctrl+L: Clear | Ctrl+Up/Down: Scroll ",
-                total, created, modified, removed
-            );
-            
-            let status_bar = Paragraph::new(status_text)
-                .style(Style::default().fg(Color::Black).bg(Color::White));
-            frame.render_widget(status_bar, status_area);
+            // Just pass the slice
+            let (slice, _) = state.file_changes.as_slices();
+             // We can re-use the make_contiguous result from above or call it again (it's cheap if already contiguous)
+             // But careful, verify if scope above dropped `inner`. Yes it did.
+             ui::components::status_bar::render(frame, status_area, slice, &theme);
             
         })?;
 
@@ -507,7 +442,6 @@ fn run_app(
                  Event::Resize(cols, rows) => {
                      // We need to handle resize carefully with split panes.
                      // The PTY size should match the *Terminal Pane* size, not the full window.
-                     // But we only know the *term_area* during render. 
                      // Simple approximation: calc what 70% is.
                      
                      let term_cols = (cols as f32 * 0.7) as u16;
@@ -539,6 +473,11 @@ fn run_app(
                             state.file_changes.clear();
                             state.list_state.select(None);
                         }
+                        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            // Cycle Theme
+                            state.current_theme = state.current_theme.cycle();
+                        }
+
                         KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             let i = match state.list_state.selected() {
                                 Some(i) => if i == 0 { 0 } else { i - 1 },
