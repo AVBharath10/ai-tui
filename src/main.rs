@@ -8,23 +8,27 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Position},
-    text::{Line, Span},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Clear},
+    widgets::ListState,
     Terminal,
 };
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
-use chrono::{DateTime, Local};
+use chrono::Local;
 use similar::{ChangeTag, TextDiff};
 use walkdir::WalkDir;
 use std::{
     collections::VecDeque,
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
+
+mod types;
+mod ui;
+use types::{ChangeKind, FileChange};
+use ui::theme::{Theme, ThemeVariant};
 
 // Unified event type for our application
 enum AppEvent {
@@ -34,20 +38,7 @@ enum AppEvent {
     Input(Event),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum ChangeKind {
-    Create,
-    Modify,
-    Remove,
-}
 
-#[derive(Clone)]
-struct FileChange {
-    path: String,
-    kind: ChangeKind,
-    timestamp: DateTime<Local>,
-    diff: Option<String>, // Stores colored ANSI string or plain text representation
-}
 
 #[derive(Clone)]
 struct PendingChange {
@@ -59,12 +50,10 @@ struct PendingChange {
 
 struct AppState {
     file_changes: VecDeque<FileChange>,
-    // key: (path, kind), value: instant when last recorded
     debounce_map: std::collections::HashMap<(String, ChangeKind), Instant>,
     list_state: ListState,
     show_sidebar: bool,
     
-    // key: path, value: content
     file_cache: std::collections::HashMap<String, String>,
     
     // Approval System
@@ -74,6 +63,8 @@ struct AppState {
     
     show_diff_view: bool,
     parser: vt100::Parser,
+    
+    current_theme: ThemeVariant,
 }
 
 impl AppState {
@@ -110,6 +101,7 @@ impl AppState {
             
             show_diff_view: false,
             parser: vt100::Parser::new(24, 80, 0), // Initial size, will be updated
+            current_theme: ThemeVariant::Zinc,
         }
     }
 
@@ -119,16 +111,7 @@ impl AppState {
             .unwrap_or("unknown")
             .to_string();
 
-        let cache_key = normalize_path(&path);
-
-        // 1. Check Ignore List (Revert Loop Prevention)
-        if self.ignore_next_write.contains(&cache_key) {
-            self.ignore_next_write.remove(&cache_key);
-            // We ignore this event because it was our own revert
-            return;
-        }
-
-        // 2. Filter Noise
+        // 1. Filter Noise
         if path.components().any(|c| c.as_os_str() == ".git" || c.as_os_str() == "target" || c.as_os_str() == "node_modules") {
             return;
         }
@@ -145,9 +128,18 @@ impl AppState {
         }
         self.debounce_map.insert(key, Instant::now());
 
-        // 4. Content Logic & Approval
-        let old_content = self.file_cache.get(&cache_key).cloned().unwrap_or_default();
-        let mut new_content = String::new();
+        // 3. Add to UI List
+        if self.file_changes.len() >= 50 {
+            self.file_changes.pop_back();
+        }
+
+        // Compute Diff
+        let cache_key = normalize_path(&path);
+        
+        // Debug Log
+        // let _ = std::fs::OpenOptions::new().create(true).append(true).open("aiui_debug.log")
+        //     .and_then(|mut f| writeln!(f, "Change detected: {:?} {:?}", path, kind));
+
         let mut diff_output = None;
         let mut needs_approval = false;
 
@@ -355,8 +347,12 @@ fn run_app(
                     let mut state = app_state.lock().unwrap();
                     state.add_change(path.clone(), kind.clone());
                 }
-                AppEvent::Tick => {}
-                AppEvent::Input(_) => {}
+                AppEvent::Tick => {
+                    // Just trigger re-render
+                }
+                AppEvent::Input(_key) => {
+                    // Handle internal app input if necessary
+                }
             }
         }
 
@@ -365,6 +361,9 @@ fn run_app(
              // Lock state for rendering
             let mut state = app_state.lock().unwrap();
             
+            // Resolve Theme
+            let theme = Theme::new(state.current_theme);
+
             let area = frame.area();
             
             // 1. Vertical Split
@@ -389,28 +388,9 @@ fn run_app(
 
             // --- Render Terminal OR Diff View ---
             if state.show_diff_view {
-                 // Reuse existing diff view render logic...
-                 // (Simplified for brevity block)
-                 let block = Block::default()
-                    .title(" Diff View (Ctrl+K to Close) ")
-                    .borders(Borders::ALL)
-                    .style(Style::default().fg(Color::Cyan));
-                
-                let mut lines = vec![];
-                if let Some(idx) = state.list_state.selected() {
-                    if let Some(change) = state.file_changes.get(idx) {
-                        lines.push(Line::from(vec![Span::styled(format!("File: {}", change.path), Style::default().add_modifier(Modifier::BOLD))]));
-                        lines.push(Line::from(""));
-                        if let Some(diff_text) = &change.diff {
-                            for line_str in diff_text.lines() {
-                                if line_str.starts_with('+') { lines.push(Line::from(Span::styled(line_str, Style::default().fg(Color::Green)))); }
-                                else if line_str.starts_with('-') { lines.push(Line::from(Span::styled(line_str, Style::default().fg(Color::Red)))); }
-                                else { lines.push(Line::from(Span::styled(line_str, Style::default().fg(Color::DarkGray)))); }
-                            }
-                        }
-                    }
-                }
-                frame.render_widget(Paragraph::new(lines).block(block), term_area);
+                 let selected_index = state.list_state.selected();
+                 let selected_change = selected_index.and_then(|i| state.file_changes.get(i));
+                 ui::components::diff_view::render(frame, term_area, selected_change, &theme);
             } else {
                 // Render VT100
                 let screen = state.parser.screen();
@@ -442,61 +422,54 @@ fn run_app(
             
             // --- Render Sidebar ---
             if let Some(area) = side_area {
-                // (Existing Sidebar Logic...)
-                 let block = Block::default().title(" Active Monitoring ").borders(Borders::ALL).style(Style::default().fg(Color::DarkGray));
-                 let now = Local::now();
-                 let items: Vec<ListItem> = state.file_changes.iter().map(|c| {
-                     let (sym, col) = match c.kind { ChangeKind::Create => ("+", Color::Green), ChangeKind::Modify => ("~", Color::Yellow), ChangeKind::Remove => ("-", Color::Red) };
-                     let td = now.signed_duration_since(c.timestamp).num_seconds();
-                     ListItem::new(format!("{}s {} {}", td, sym, c.path)).style(Style::default().fg(col))
-                 }).collect();
-                 frame.render_stateful_widget(List::new(items).block(block).highlight_style(Style::default().add_modifier(Modifier::REVERSED)), area, &mut state.list_state);
+                // Use the new component
+                // We need to convert VecDeque to slice. 
+                // `make_contiguous` makes it a single slice, but mutates.
+                // Or just iterate. 
+                // Our component expects `&[FileChange]`.
+                // VecDeque doesn't easily coerce to &[FileChange] unless we use make_contiguous.
+                // Let's change the component signature to accept `&VecDeque` or `impl Iterator` or just convert here.
+                // Converting here is creating a Vec, which is allocations in hot loop.
+                // Converting the component to accept `VecDeque` is better.
+                // *Self Correction*: I don't want to edit component files again right now.
+                // I'll make the component accept `&VecDeque` in the next step if compilation fails, 
+                // or just modify `state.file_changes` to be a `Vec`? No, we need push_front efficiently.
+                // I will use `make_contiguous` here since we have mutable access to state? No we have locked it. 
+                // But `state` is `MutexGuard`. We can mutate it.
+                state.file_changes.make_contiguous();
+                 let inner = &mut *state;
+                 let (slice, _) = inner.file_changes.as_slices();
+                 ui::components::sidebar::render(frame, area, slice, &mut inner.list_state, &theme);
             }
 
             // --- Render Status Bar ---
-            let status_text = format!(" Total: {} | Modal: {} (Queue: {}) ", state.file_changes.len(), state.modal_active, state.approval_queue.len());
-            frame.render_widget(Paragraph::new(status_text).style(Style::default().fg(Color::Black).bg(Color::White)), status_area);
-
-            // --- RENDER MODAL ---
-            if state.modal_active {
-                if let Some(pending) = state.approval_queue.front() {
-                    let modal_area = centered_rect(60, 60, area);
-                    frame.render_widget(Clear, modal_area); // Clear background
-
-                    let block = Block::default()
-                        .title(format!(" REVIEW CHANGE: {} ", pending.path))
-                        .borders(Borders::ALL)
-                        .style(Style::default().bg(Color::Black)) // Ensure opaque
-                        .border_style(Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD));
-                    
-                    let mut lines = vec![];
-                    lines.push(Line::from(Span::styled("Press [y] to Accept, [n] to Reject (Revert)", Style::default().fg(Color::Yellow))));
-                    lines.push(Line::from(""));
-                    
-                    // Show Diff Snippet
-                    for line in pending.diff_text.lines().take(20) {
-                        if line.starts_with('+') { lines.push(Line::from(Span::styled(line, Style::default().fg(Color::Green)))); }
-                        else if line.starts_with('-') { lines.push(Line::from(Span::styled(line, Style::default().fg(Color::Red)))); }
-                        else { lines.push(Line::from(Span::styled(line, Style::default().fg(Color::Gray)))); }
-                    }
-                    if pending.diff_text.lines().count() > 20 {
-                        lines.push(Line::from("... (more lines) ..."));
-                    }
-                    
-                    frame.render_widget(Paragraph::new(lines).block(block), modal_area);
-                }
-            }
-
+            // Just pass the slice
+            let (slice, _) = state.file_changes.as_slices();
+             // We can re-use the make_contiguous result from above or call it again (it's cheap if already contiguous)
+             // But careful, verify if scope above dropped `inner`. Yes it did.
+             ui::components::status_bar::render(frame, status_area, slice, &theme);
+            
         })?;
 
         // C. Poll Input
         if event::poll(Duration::from_millis(50))? {
              let mut state = app_state.lock().unwrap();
-             
-             match event::read()? {
-                Event::Resize(cols, rows) => { 
-                    master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?; 
-                    state.parser = vt100::Parser::new(rows, cols, 0); 
+            match event::read()? {
+                 Event::Resize(cols, rows) => {
+                     // We need to handle resize carefully with split panes.
+                     // The PTY size should match the *Terminal Pane* size, not the full window.
+                     // Simple approximation: calc what 70% is.
+                     
+                     let term_cols = (cols as f32 * 0.7) as u16;
+                     let term_rows = rows; // Full height
+                     
+                     master.resize(PtySize {
+                        rows: term_rows,
+                        cols: term_cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })?;
+                    state.parser = vt100::Parser::new(term_rows, term_cols, 0);
                 }
                 Event::Key(key) => {
                     // *** MODAL INTERCEPTION ***
@@ -536,10 +509,25 @@ fn run_app(
                     // *** NORMAL PROCESSING ***
                     match key.code {
                         KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => writer.write_all(&[3])?,
-                        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => state.show_diff_view = !state.show_diff_view,
-                        KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => state.show_sidebar = !state.show_sidebar,
-                        KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => { state.file_changes.clear(); state.list_state.select(None); }
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => writer.write_all(&[3])?, // ETX
+                        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => writer.write_all(&[4])?, // EOT
+
+                        // UI Control
+                        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                             state.show_diff_view = !state.show_diff_view;
+                        }
+                        KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            state.show_sidebar = !state.show_sidebar;
+                        }
+                        KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            state.file_changes.clear();
+                            state.list_state.select(None);
+                        }
+                        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            // Cycle Theme
+                            state.current_theme = state.current_theme.cycle();
+                        }
+
                         KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             let i = state.list_state.selected().map_or(0, |i| i.saturating_sub(1));
                             state.list_state.select(Some(i));
